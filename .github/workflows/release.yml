@@ -1,0 +1,175 @@
+name: Build Release APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Custom release version name (e.g. 1.2.0). If blank, auto-increments.'
+        required: false
+        default: ''
+      release_title:
+        description: 'Title for the release'
+        required: false
+        default: ''
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Package Release APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate Ascending Version Numbers
+        id: versioning
+        run: |
+          # Strictly ascending integer version code based on GitHub Actions run number
+          # Guarantees each build has a higher versionCode than any previous build
+          BASE_OFFSET=100
+          VERSION_CODE=$((BASE_OFFSET + GITHUB_RUN_NUMBER))
+          
+          # Compute human-readable ascending version name
+          if [ -n "${{ github.event.inputs.version_name }}" ]; then
+            VERSION_NAME="${{ github.event.inputs.version_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION_NAME="${GITHUB_REF_NAME#v}"
+          else
+            VERSION_NAME="1.0.${GITHUB_RUN_NUMBER}"
+          fi
+          
+          echo "Computed versionCode: ${VERSION_CODE}"
+          echo "Computed versionName: ${VERSION_NAME}"
+          
+          echo "VERSION_CODE=${VERSION_CODE}" >> $GITHUB_ENV
+          echo "VERSION_NAME=${VERSION_NAME}" >> $GITHUB_ENV
+          echo "version_code=${VERSION_CODE}" >> $GITHUB_OUTPUT
+          echo "version_name=${VERSION_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Prepare Keystore for Release Signing
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KEYSTORE_DIR="${RUNNER_TEMP}/keystore"
+          mkdir -p "${KEYSTORE_DIR}"
+          KEYSTORE_PATH="${KEYSTORE_DIR}/release-upload.jks"
+          
+          if [ -n "${KEYSTORE_BASE64}" ]; then
+            echo "Using repository secret signing keystore..."
+            echo "${KEYSTORE_BASE64}" | base64 -d > "${KEYSTORE_PATH}"
+            echo "STORE_PASSWORD=${KEYSTORE_PASSWORD}" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=${KEY_PASSWORD}" >> $GITHUB_ENV
+          else
+            echo "Generating secure release signing keystore for automated CI/CD..."
+            PASSWORD="NodeForgeReleaseKeyPass_${GITHUB_RUN_NUMBER}"
+            keytool -genkeypair -v \
+              -keystore "${KEYSTORE_PATH}" \
+              -alias "upload" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "${PASSWORD}" \
+              -keypass "${PASSWORD}" \
+              -dname "CN=NodeForge Release, OU=Mobile IDE, O=NodeForge, L=Cloud, S=Global, C=US"
+            echo "STORE_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=${PASSWORD}" >> $GITHUB_ENV
+          fi
+          
+          echo "KEYSTORE_PATH=${KEYSTORE_PATH}" >> $GITHUB_ENV
+
+      - name: Make Gradle Wrapper Executable
+        run: chmod +x ./gradlew
+
+      - name: Run Unit Tests
+        run: ./gradlew :app:testDebugUnitTest --no-daemon
+
+      - name: Assemble Release APK
+        env:
+          VERSION_CODE: ${{ env.VERSION_CODE }}
+          VERSION_NAME: ${{ env.VERSION_NAME }}
+          KEYSTORE_PATH: ${{ env.KEYSTORE_PATH }}
+          STORE_PASSWORD: ${{ env.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ env.KEY_PASSWORD }}
+        run: |
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Verify & Package Release APK
+        id: package
+        run: |
+          APK_SRC=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$APK_SRC" ]; then
+            echo "Error: Release APK not found!"
+            exit 1
+          fi
+          
+          OUTPUT_NAME="NodeForge-v${VERSION_NAME}-build${VERSION_CODE}-release.apk"
+          cp "$APK_SRC" "$OUTPUT_NAME"
+          
+          echo "Packaged APK: $OUTPUT_NAME"
+          ls -lh "$OUTPUT_NAME"
+          
+          echo "apk_path=$OUTPUT_NAME" >> $GITHUB_OUTPUT
+          echo "apk_name=$OUTPUT_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NodeForge-v${{ env.VERSION_NAME }}-release-apk
+          path: ${{ steps.package.outputs.apk_path }}
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION_NAME }}
+          name: NodeForge v${{ env.VERSION_NAME }} (Build #${{ env.VERSION_CODE }})
+          body: |
+            ## 🚀 NodeForge Release v${{ env.VERSION_NAME }}
+            
+            ### Build Information
+            - **Version Code**: `${{ env.VERSION_CODE }}` (Ascending build counter)
+            - **Version Name**: `${{ env.VERSION_NAME }}`
+            - **Commit**: `${{ github.sha }}`
+            - **Pipeline**: Automated GitHub Actions CI/CD
+            
+            ### Included Features
+            - 🟢 Mobile Node.js V8 execution engine and HTTP server runtime
+            - 💻 Real-time syntax-colored terminal & interactive REPL
+            - 📝 Multi-tab code editor with QuickCode touch bar and virtual filesystem
+            - 📦 OCI containerized environment and deployment manager
+            - 🌿 Offline Git version control and GitHub remote sync
+            - 🤖 Integrated AI Code Assistant (code explanation, bug fixing, test generation)
+            - 👥 Team feedback loops & inline code review comments
+            - 🛡️ Role-Based Access Control (RBAC) and immutable security audit logs
+            
+            Download the signed release APK below to install directly on Android.
+          files: ${{ steps.package.outputs.apk_path }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

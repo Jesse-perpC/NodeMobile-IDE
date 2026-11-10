@@ -1,0 +1,6 @@
+{
+  "name": "NodeForge",
+  "description": "Mobile Node.js IDE, containerized runner, interactive terminal, and code deployment platform for Android.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
